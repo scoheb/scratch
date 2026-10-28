@@ -1,0 +1,162 @@
+# Stage-only managed Release Pipeline. Host this file at a pinned Git revision
+# before referencing it from a ReleasePlanAdmission.
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: hum-5186-inspect-pr-image
+spec:
+  results:
+    - name: PR_IMAGE
+      value: $(tasks.inspect-pr-image.results.PR_IMAGE)
+    - name: PR_SNAPSHOT
+      value: $(tasks.inspect-pr-image.results.PR_SNAPSHOT)
+    - name: PR_COMMIT
+      value: $(tasks.inspect-pr-image.results.PR_COMMIT)
+    - name: MERGE_COMMIT
+      value: $(tasks.inspect-pr-image.results.MERGE_COMMIT)
+  params:
+    - name: release
+      type: string
+    - name: releasePlan
+      type: string
+    - name: snapshot
+      type: string
+  tasks:
+    - name: inspect-pr-image
+      taskSpec:
+        results:
+          - name: PR_IMAGE
+          - name: PR_SNAPSHOT
+          - name: PR_COMMIT
+          - name: MERGE_COMMIT
+        steps:
+          - name: inspect
+            image: registry.access.redhat.com/ubi9/python-311
+            env:
+              - name: RELEASE_REF
+                value: $(params.release)
+              - name: SNAPSHOT_REF
+                value: $(params.snapshot)
+              - name: RESULT_PR_IMAGE_PATH
+                value: $(results.PR_IMAGE.path)
+              - name: RESULT_PR_SNAPSHOT_PATH
+                value: $(results.PR_SNAPSHOT.path)
+              - name: RESULT_PR_COMMIT_PATH
+                value: $(results.PR_COMMIT.path)
+              - name: RESULT_MERGE_COMMIT_PATH
+                value: $(results.MERGE_COMMIT.path)
+            script: |
+              #!/usr/bin/env python3
+              import json
+              import os
+              import re
+              import ssl
+              from pathlib import Path
+              from urllib.parse import quote
+              from urllib.request import Request, urlopen
+
+              IMAGE_RE = re.compile(
+                  r"quay\.io/redhat-user-workloads-stage/shebert-tenant/merge-queue-release-test@"
+                  r"(?P<digest>sha256:[0-9a-f]{64})\Z"
+              )
+              NAME_RE = re.compile(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?\Z")
+              token = Path("/var/run/secrets/kubernetes.io/serviceaccount/token").read_text()
+              ca_file = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+              kube_context = ssl.create_default_context(cafile=ca_file)
+              host = os.environ["KUBERNETES_SERVICE_HOST"]
+              port = os.environ.get("KUBERNETES_SERVICE_PORT_HTTPS", "443")
+
+              def snapshot(reference):
+                  parts = reference.split("/")
+                  if len(parts) != 2 or any(not NAME_RE.fullmatch(part) for part in parts):
+                      raise ValueError(f"invalid Snapshot reference: {reference}")
+                  namespace, name = parts
+                  if namespace != "shebert-tenant":
+                      raise ValueError("release inspection is limited to shebert-tenant")
+                  url = (
+                      f"https://{host}:{port}/apis/appstudio.redhat.com/v1alpha1/"
+                      f"namespaces/{namespace}/snapshots/{quote(name)}"
+                  )
+                  with urlopen(
+                      Request(url, headers={"Authorization": f"Bearer {token}"}),
+                      context=kube_context,
+                      timeout=20,
+                  ) as response:
+                      return json.load(response)
+
+              push = snapshot(os.environ["SNAPSHOT_REF"])
+              if push["metadata"]["labels"].get("pac.test.appstudio.openshift.io/event-type") != "push":
+                  raise ValueError("Release Snapshot is not a push Snapshot")
+              if push["spec"]["application"] != "merge-queue-release-test":
+                  raise ValueError("unexpected Application")
+              pr_name = push["metadata"]["annotations"].get("test.appstudio.openshift.io/result-pr-snapshot")
+              if not pr_name or not NAME_RE.fullmatch(pr_name):
+                  raise ValueError("push Snapshot has no valid PR_SNAPSHOT result")
+              pr = snapshot(f"shebert-tenant/{pr_name}")
+              if pr["spec"]["application"] != push["spec"]["application"]:
+                  raise ValueError("PR Snapshot Application differs")
+              if pr["metadata"]["labels"].get("pac.test.appstudio.openshift.io/event-type") not in {
+                  "pull_request", "retest-all-comment"
+              }:
+                  raise ValueError("referenced Snapshot is not from a PR")
+              for item in (push, pr):
+                  if not any(
+                      condition.get("type") == "AppStudioTestSucceeded"
+                      and condition.get("status") == "True"
+                      for condition in item.get("status", {}).get("conditions", [])
+                  ):
+                      raise ValueError(f"Snapshot {item['metadata']['name']} has not passed tests")
+              component = "merge-queue-release-test"
+              built = []
+              for item in (push, pr):
+                  matches = [entry for entry in item["spec"]["components"] if entry["name"] == component]
+                  if len(matches) != 1:
+                      raise ValueError(f"Snapshot {item['metadata']['name']} has no unique component")
+                  built.append(matches[0])
+              promoted, original = built
+              if promoted["containerImage"] != original["containerImage"]:
+                  raise ValueError("promoted image differs from original PR image")
+              match = IMAGE_RE.fullmatch(promoted["containerImage"])
+              if match is None:
+                  raise ValueError("image is not the staging test repository at a digest")
+              pr_sha = original["source"]["git"]["revision"]
+              if promoted["source"]["git"]["revision"] != pr_sha:
+                  raise ValueError("promoted source commit differs from PR build")
+              if pr["metadata"]["labels"].get("pac.test.appstudio.openshift.io/sha") != pr_sha:
+                  raise ValueError("PR Snapshot source commit differs from PR metadata")
+              digest = match.group("digest")
+              registry_url = (
+                  "https://quay.io/v2/redhat-user-workloads-stage/shebert-tenant/"
+                  f"merge-queue-release-test/manifests/{digest}"
+              )
+              with urlopen(
+                  Request(
+                      registry_url,
+                      headers={"Accept": "application/vnd.oci.image.manifest.v1+json"},
+                  ),
+                  timeout=20,
+              ) as response:
+                  actual_digest = response.headers.get("Docker-Content-Digest")
+                  manifest = json.load(response)
+              if actual_digest != digest or manifest.get("schemaVersion") != 2:
+                  raise ValueError("registry manifest digest or schema differs")
+              merge_sha = push["metadata"]["annotations"].get("pac.test.appstudio.openshift.io/sha")
+              for name, value in (
+                  ("PR_IMAGE", promoted["containerImage"]),
+                  ("PR_SNAPSHOT", pr_name),
+                  ("PR_COMMIT", pr_sha),
+                  ("MERGE_COMMIT", merge_sha),
+              ):
+                  if not value:
+                      raise ValueError(f"missing {name}")
+                  Path(os.environ[f"RESULT_{name}_PATH"]).write_text(value)
+              print(json.dumps({
+                  "release": os.environ["RELEASE_REF"],
+                  "push_snapshot": push["metadata"]["name"],
+                  "pr_snapshot": pr_name,
+                  "pr_commit": pr_sha,
+                  "merge_commit": merge_sha,
+                  "image": promoted["containerImage"],
+                  "manifest_media_type": manifest.get("mediaType"),
+                  "layers": len(manifest.get("layers", [])),
+              }, sort_keys=True))
